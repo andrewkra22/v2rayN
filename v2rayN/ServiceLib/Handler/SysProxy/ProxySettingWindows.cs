@@ -198,6 +198,234 @@ public static class ProxySettingWindows
     }
 
     /// <summary>
+    /// Read the current proxy settings of the LAN connection and of every dial up connection
+    /// </summary>
+    /// <exception cref="ApplicationException">Error message with win32 error code</exception>
+    public static WindowsProxySnapshot GetProxySnapshot()
+    {
+        var snapshot = new WindowsProxySnapshot();
+        snapshot.Connections.Add(GetConnectionProxy(null));
+
+        IEnumerable<string> connections;
+        try
+        {
+            connections = EnumerateRasEntries();
+        }
+        catch
+        {
+            // keep at least the LAN settings when dial up connections cannot be listed
+            connections = [];
+        }
+        foreach (var connection in connections)
+        {
+            snapshot.Connections.Add(GetConnectionProxy(connection));
+        }
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Read the current proxy settings of one connection
+    /// </summary>
+    /// <param name="connectionName">dial up connection name, null for LAN</param>
+    /// <exception cref="ApplicationException">Error message with win32 error code</exception>
+    public static WindowsProxyConnectionSettings GetConnectionProxy(string? connectionName)
+    {
+        var options = new InternetConnectionOption[4];
+        // INTERNET_PER_CONN_FLAGS_UI returns the flags as the user set them, including auto detect
+        options[0].m_Option = PerConnOption.INTERNET_PER_CONN_FLAGS_UI;
+        options[1].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_SERVER;
+        options[2].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_BYPASS;
+        options[3].m_Option = PerConnOption.INTERNET_PER_CONN_AUTOCONFIG_URL;
+
+        var list = new InternetPerConnOptionList();
+        list.dwSize = Marshal.SizeOf(list);
+        list.szConnection = connectionName != null ? Marshal.StringToHGlobalAuto(connectionName) : nint.Zero;
+        list.dwOptionCount = options.Length;
+        list.dwOptionError = 0;
+
+        var optSize = Marshal.SizeOf<InternetConnectionOption>();
+        var optionsPtr = Marshal.AllocCoTaskMem(optSize * options.Length);
+        var listPtr = nint.Zero;
+        try
+        {
+            for (var i = 0; i < options.Length; ++i)
+            {
+                Marshal.StructureToPtr(options[i], optionsPtr + (i * optSize), false);
+            }
+            list.options = optionsPtr;
+
+            listPtr = Marshal.AllocCoTaskMem(list.dwSize);
+            Marshal.StructureToPtr(list, listPtr, false);
+
+            var size = list.dwSize;
+            if (!NativeMethods.InternetQueryOption(nint.Zero, InternetOption.INTERNET_OPTION_PER_CONNECTION_OPTION, listPtr, ref size))
+            {
+                throw new ApplicationException($"Query Internet Proxy failed with error code: {Marshal.GetLastPInvokeError()}");
+            }
+
+            for (var i = 0; i < options.Length; ++i)
+            {
+                options[i] = Marshal.PtrToStructure<InternetConnectionOption>(optionsPtr + (i * optSize));
+            }
+
+            return new WindowsProxyConnectionSettings
+            {
+                Connection = connectionName,
+                Flags = options[0].m_Value.m_Int,
+                ProxyServer = PtrToStringAndFree(options[1].m_Value.m_StringPtr),
+                ProxyBypass = PtrToStringAndFree(options[2].m_Value.m_StringPtr),
+                AutoConfigUrl = PtrToStringAndFree(options[3].m_Value.m_StringPtr),
+            };
+        }
+        finally
+        {
+            if (list.szConnection != nint.Zero)
+            {
+                Marshal.FreeHGlobal(list.szConnection);
+            }
+            Marshal.FreeCoTaskMem(optionsPtr);
+            if (listPtr != nint.Zero)
+            {
+                Marshal.FreeCoTaskMem(listPtr);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Put back proxy settings read by <see cref="GetProxySnapshot"/>.
+    /// Dial up connections that did not exist when the snapshot was taken are set to use no proxy.
+    /// </summary>
+    /// <returns>true: one of connection is successfully restored</returns>
+    public static bool RestoreProxySnapshot(WindowsProxySnapshot snapshot)
+    {
+        var lan = snapshot.Connections.FirstOrDefault(t => t.Connection == null);
+        try
+        {
+            var result = RestoreConnectionProxy(null, lan);
+            var connections = EnumerateRasEntries();
+            foreach (var connection in connections)
+            {
+                var settings = snapshot.Connections.FirstOrDefault(t => t.Connection == connection);
+                result |= RestoreConnectionProxy(connection, settings);
+            }
+            return result;
+        }
+        catch
+        {
+            _ = RestoreProxyFallback(lan);
+            return false;
+        }
+    }
+
+    private static bool RestoreConnectionProxy(string? connectionName, WindowsProxyConnectionSettings? settings)
+    {
+        if (settings == null)
+        {
+            return SetConnectionProxy(connectionName, null, null, 1);
+        }
+        return SetConnectionOptions(connectionName, settings.Flags, settings.ProxyServer, settings.ProxyBypass, settings.AutoConfigUrl);
+    }
+
+    private static bool RestoreProxyFallback(WindowsProxyConnectionSettings? settings)
+    {
+        if (settings == null)
+        {
+            return SetProxyFallback(null, null, 1);
+        }
+
+        var useProxy = (settings.Flags & (int)PerConnFlags.PROXY_TYPE_PROXY) != 0;
+        var useAutoConfig = (settings.Flags & (int)PerConnFlags.PROXY_TYPE_AUTO_PROXY_URL) != 0;
+        WindowsUtils.RegWriteValue(_regPath, "ProxyEnable", useProxy ? 1 : 0);
+        WindowsUtils.RegWriteValue(_regPath, "ProxyServer", settings.ProxyServer ?? string.Empty);
+        WindowsUtils.RegWriteValue(_regPath, "ProxyOverride", settings.ProxyBypass ?? string.Empty);
+        WindowsUtils.RegWriteValue(_regPath, "AutoConfigURL", useAutoConfig ? settings.AutoConfigUrl ?? string.Empty : string.Empty);
+        return true;
+    }
+
+    /// <summary>
+    /// Set all proxy options of one connection at once
+    /// </summary>
+    /// <exception cref="ApplicationException">Error message with win32 error code</exception>
+    private static bool SetConnectionOptions(string? connectionName, int flags, string? proxyServer, string? proxyBypass, string? autoConfigUrl)
+    {
+        var options = new InternetConnectionOption[4];
+        options[0].m_Option = PerConnOption.INTERNET_PER_CONN_FLAGS;
+        options[0].m_Value.m_Int = flags;
+        options[1].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_SERVER;
+        options[1].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(proxyServer ?? string.Empty);
+        options[2].m_Option = PerConnOption.INTERNET_PER_CONN_PROXY_BYPASS;
+        options[2].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(proxyBypass ?? string.Empty);
+        options[3].m_Option = PerConnOption.INTERNET_PER_CONN_AUTOCONFIG_URL;
+        options[3].m_Value.m_StringPtr = Marshal.StringToHGlobalAuto(autoConfigUrl ?? string.Empty);
+
+        var list = new InternetPerConnOptionList();
+        list.dwSize = Marshal.SizeOf(list);
+        list.szConnection = connectionName != null ? Marshal.StringToHGlobalAuto(connectionName) : nint.Zero;
+        list.dwOptionCount = options.Length;
+        list.dwOptionError = 0;
+
+        var optSize = Marshal.SizeOf<InternetConnectionOption>();
+        var optionsPtr = Marshal.AllocCoTaskMem(optSize * options.Length);
+        var listPtr = nint.Zero;
+        try
+        {
+            for (var i = 0; i < options.Length; ++i)
+            {
+                Marshal.StructureToPtr(options[i], optionsPtr + (i * optSize), false);
+            }
+            list.options = optionsPtr;
+
+            listPtr = Marshal.AllocCoTaskMem(list.dwSize);
+            Marshal.StructureToPtr(list, listPtr, false);
+
+            if (!NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_PER_CONNECTION_OPTION, listPtr, list.dwSize))
+            {
+                throw new ApplicationException($"Restore Internet Proxy failed with error code: {Marshal.GetLastPInvokeError()}");
+            }
+
+            // Notify the system that the registry settings have been changed and cause them to be refreshed
+            _ = NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_SETTINGS_CHANGED, nint.Zero, 0);
+            _ = NativeMethods.InternetSetOption(nint.Zero, InternetOption.INTERNET_OPTION_REFRESH, nint.Zero, 0);
+            return true;
+        }
+        finally
+        {
+            if (list.szConnection != nint.Zero)
+            {
+                Marshal.FreeHGlobal(list.szConnection);
+            }
+            for (var i = 1; i < options.Length; ++i)
+            {
+                Marshal.FreeHGlobal(options[i].m_Value.m_StringPtr);
+            }
+            Marshal.FreeCoTaskMem(optionsPtr);
+            if (listPtr != nint.Zero)
+            {
+                Marshal.FreeCoTaskMem(listPtr);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Strings returned by InternetQueryOption are allocated with GlobalAlloc and must be freed by the caller
+    /// </summary>
+    private static string? PtrToStringAndFree(nint ptr)
+    {
+        if (ptr == nint.Zero)
+        {
+            return null;
+        }
+        try
+        {
+            return Marshal.PtrToStringAuto(ptr);
+        }
+        finally
+        {
+            _ = NativeMethods.GlobalFree(ptr);
+        }
+    }
+
+    /// <summary>
     /// Retrieve list of connections including LAN and WAN to support PPPoE connection
     /// </summary>
     /// <returns>A list of RAS connection names. May be empty list if no dial up connection.</returns>
@@ -318,7 +546,8 @@ public static class ProxySettingWindows
         INTERNET_PER_CONN_FLAGS = 1, // Sets or retrieves the connection type. The Value member will contain one or more of the values from PerConnFlags
         INTERNET_PER_CONN_PROXY_SERVER = 2, // Sets or retrieves a string containing the proxy servers.
         INTERNET_PER_CONN_PROXY_BYPASS = 3, // Sets or retrieves a string containing the URLs that do not use the proxy server.
-        INTERNET_PER_CONN_AUTOCONFIG_URL = 4//, // Sets or retrieves a string containing the URL to the automatic configuration script.
+        INTERNET_PER_CONN_AUTOCONFIG_URL = 4, // Sets or retrieves a string containing the URL to the automatic configuration script.
+        INTERNET_PER_CONN_FLAGS_UI = 10 // Retrieves the connection type as set in the UI, including PROXY_TYPE_AUTO_DETECT (Windows 7 and later).
     }
 
     //
@@ -346,6 +575,13 @@ public static class ProxySettingWindows
         [DllImport("WinInet.dll", SetLastError = true, CharSet = CharSet.Auto)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool InternetSetOption(nint hInternet, InternetOption dwOption, nint lpBuffer, int dwBufferLength);
+
+        [DllImport("WinInet.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool InternetQueryOption(nint hInternet, InternetOption dwOption, nint lpBuffer, ref int lpdwBufferLength);
+
+        [DllImport("kernel32.dll")]
+        public static extern nint GlobalFree(nint hMem);
 
         [DllImport("Rasapi32.dll", CharSet = CharSet.Auto)]
         public static extern uint RasEnumEntries(
