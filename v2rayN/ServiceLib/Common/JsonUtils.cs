@@ -228,6 +228,7 @@ public class JsonUtils
 [JsonSerializable(typeof(ServerStatItem))]
 [JsonSerializable(typeof(WebDavItem))]
 [JsonSerializable(typeof(KeyEventItem))]
+[JsonSerializable(typeof(WindowsProxySnapshot))]
 [JsonSerializable(typeof(SubItem))]
 [JsonSerializable(typeof(SingboxConfig))]
 [JsonSerializable(typeof(Dns4Sbox))]
